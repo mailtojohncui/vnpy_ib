@@ -59,6 +59,8 @@ from vnpy.trader.utility import get_file_path, ZoneInfo
 from vnpy.trader.event import EVENT_TIMER
 from vnpy.event import Event
 
+from .future_alias import is_alias, resolve_alias
+
 # 委托状态映射
 STATUS_IB2VT: dict[str, Status] = {
     "ApiPending": Status.SUBMITTING,
@@ -702,7 +704,8 @@ class IbApi(EWrapper):
             contract.option_expiry = datetime.strptime(ib_contract.lastTradeDateOrContractMonth, "%Y%m%d")
             contract.option_underlying = underlying_symbol + "_" + ib_contract.lastTradeDateOrContractMonth
 
-        if contract.vt_symbol not in self.contracts:
+        # 期货简写代码换月后需要刷新对应的IB合约（自定义扩展）
+        if contract.vt_symbol not in self.contracts or is_alias(contract.symbol):
             self.gateway.on_contract(contract)
 
             self.contracts[contract.vt_symbol] = contract
@@ -933,6 +936,14 @@ class IbApi(EWrapper):
             self.gateway.write_log("订阅失败，合约代码中包含空格")
             return
 
+        # 期货简写代码：检查交易所（自定义扩展）
+        if is_alias(req.symbol):
+            full_symbol, alias_exchange = resolve_alias(req.symbol)
+            if req.exchange.value != alias_exchange:
+                self.gateway.write_log(f"订阅失败，{req.symbol}请选择交易所{alias_exchange}")
+                return
+            self.gateway.write_log(f"{req.symbol}当前主力合约：{full_symbol}")
+
         # 过滤重复订阅
         if req.vt_symbol in self.subscribed:
             return
@@ -949,7 +960,7 @@ class IbApi(EWrapper):
         self.client.reqContractDetails(self.reqid, ib_contract)
 
         # 如果使用了字符串风格的代码，则需要缓存
-        if "-" in req.symbol:
+        if "-" in req.symbol or is_alias(req.symbol):
             self.reqid_symbol_map[self.reqid] = req.symbol
 
         #  订阅tick数据并创建tick对象缓冲区
@@ -1135,6 +1146,21 @@ class IbApi(EWrapper):
         exchange: Exchange = EXCHANGE_IB2VT.get(ib_contract.exchange, Exchange.SMART)
         vt_symbol: str = f"{symbol}.{exchange.value}"
 
+        # 当前主力合约已用简写代码订阅，则使用简写代码（自定义扩展）
+        if (
+            vt_symbol not in self.contracts
+            and ib_contract.secType == "FUT"
+            and is_alias(ib_contract.symbol)
+        ):
+            full_symbol, alias_exchange = resolve_alias(ib_contract.symbol)
+            month: str = full_symbol.split(JOIN_SYMBOL)[1]
+            alias_vt_symbol: str = f"{ib_contract.symbol}.{alias_exchange}"
+            if (
+                ib_contract.lastTradeDateOrContractMonth.startswith(month)
+                and alias_vt_symbol in self.contracts
+            ):
+                return ib_contract.symbol
+
         # 在合约信息中找不到字符串风格代码，则使用数字代码
         if vt_symbol not in self.contracts:
             symbol = str(ib_contract.conId)
@@ -1191,6 +1217,11 @@ class IbApi(EWrapper):
 
 def generate_ib_contract(symbol: str, exchange: Exchange) -> Contract | None:
     """生产IB合约"""
+    # 期货简写代码，换算为当前主力合约（自定义扩展）
+    if is_alias(symbol):
+        full_symbol, _ = resolve_alias(symbol)
+        return generate_ib_contract(full_symbol, exchange)
+
     # 字符串代码
     if "-" in symbol:
         try:
