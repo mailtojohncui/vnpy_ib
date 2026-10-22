@@ -251,7 +251,7 @@ def modify_order(gateway: IbGateway, orderid: str, price: float) -> bool:
         order.clientId = api.clientid
         order.action = DIRECTION_VT2IB[data.direction]
         order.orderType = ORDERTYPE_VT2IB[data.type]
-        order.totalQuantity = Decimal(str(data.volume - data.traded))
+        order.totalQuantity = Decimal(str(float(data.volume) - float(data.traded)))
         order.account = api.account
         order.tif = "GTC"
 

@@ -148,6 +148,7 @@ def test_open_order_records_parent_for_restored_orders(armed: IbApi, recorder: C
 
     armed.openOrder(42, contract, order, OrderState())
     assert armed.order_parents["42"] == "41"
+    assert isinstance(armed.orders["42"].volume, float)          # 恢复的委托数量是 float
     assert armed.ib_open_orders["42"][1] is order
 
     # 重启后恢复的单子也能改价

@@ -575,7 +575,7 @@ class IbApi(EWrapper):
                 type=ORDERTYPE_IB2VT[ib_order.orderType],
                 orderid=orderid,
                 direction=DIRECTION_IB2VT[ib_order.action],
-                volume=ib_order.totalQuantity,
+                volume=float(ib_order.totalQuantity),     # IB 返回 Decimal，统一为 float（自定义修改）
                 datetime=dt,
                 gateway_name=self.gateway_name,
             )
