@@ -303,6 +303,11 @@ class IbApi(EWrapper):
 
         self.ib_contracts: dict[str, Contract] = {}
 
+        # 图上交易扩展用（自定义扩展，见 order_ext.py）
+        self.ib_open_orders: dict[str, tuple[Contract, Order]] = {}    # openOrder 回报的 IB 委托
+        self.chart_orders: dict[str, tuple[Contract, Order]] = {}      # 本地下单时保存的 IB 委托
+        self.order_parents: dict[str, str] = {}                        # 括号单子单 -> 入场单
+
     def connectAck(self) -> None:
         """连接成功回报"""
         self.status = True
@@ -550,6 +555,11 @@ class IbApi(EWrapper):
         super().openOrder(orderId, ib_contract, ib_order, orderState)
 
         orderid: str = str(orderId)
+
+        # 记录 IB 委托对象和括号单关系，供图上改单使用（自定义扩展）
+        self.ib_open_orders[orderid] = (ib_contract, ib_order)
+        if ib_order.parentId:
+            self.order_parents[orderid] = str(ib_order.parentId)
 
         if ib_order.orderRef:
             dt: datetime = datetime.strptime(ib_order.orderRef, "%Y-%m-%d %H:%M:%S")
