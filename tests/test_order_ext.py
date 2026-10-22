@@ -72,6 +72,7 @@ def test_bracket_long(gateway: IbGateway, armed: IbApi, recorder: CallRecorder, 
     assert sl.action == "SELL" and sl.orderType == "STP" and sl.auxPrice == 29780.0
     assert tp.parentId == 1 and sl.parentId == 1
     assert tp.totalQuantity == Decimal("2") and tp.tif == "GTC"
+    assert parent.outsideRth and tp.outsideRth and sl.outsideRth      # 止损在常规时段之外也能触发
 
     assert armed.order_parents == {"2": "1", "3": "1"}
     assert order_ext.get_parent(gateway, "3") == "1"
@@ -154,3 +155,4 @@ def test_open_order_records_parent_for_restored_orders(armed: IbApi, recorder: C
     assert order_ext.modify_order(armed.gateway, "42", 29710.0)
     order_id, _, sent = placed(recorder)[-1]
     assert order_id == 42 and sent.auxPrice == 29710.0 and sent.parentId == 41
+    assert sent.outsideRth          # 旧单改价时补上盘外触发

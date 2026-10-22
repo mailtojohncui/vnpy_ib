@@ -58,6 +58,7 @@ def _build(api: IbApi, req: OrderRequest, tif: str) -> tuple[Contract, Order] | 
     order.account = api.account
     order.orderRef = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     order.tif = tif
+    order.outsideRth = True     # 允许在常规交易时段之外触发/成交（期货夜盘、盘前盘后）
 
     if req.type == OrderType.LIMIT:
         order.lmtPrice = req.price
@@ -253,6 +254,8 @@ def modify_order(gateway: IbGateway, orderid: str, price: float) -> bool:
         order.totalQuantity = Decimal(str(data.volume - data.traded))
         order.account = api.account
         order.tif = "GTC"
+
+    order.outsideRth = True     # 改单时一并补上，旧单拖动一次即可在盘外触发
 
     if order.orderType == "LMT":
         order.lmtPrice = price
