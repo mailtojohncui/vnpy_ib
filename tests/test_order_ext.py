@@ -263,3 +263,28 @@ def test_modify_order_volume(gateway: IbGateway, armed: IbApi, sink: Sink, monke
     armed.orders[oid].status = Status.NOTTRADED
     assert order_ext.modify_order(gateway, oid, 29001.0, 3)
     assert calls[-1][2].totalQuantity == Decimal("3") and armed.orders[oid].volume == 3
+
+
+def test_foreign_order_with_non_time_order_ref_and_unsupported_type(gateway: IbGateway, armed: IbApi, sink: Sink) -> None:  # noqa: F811
+    armed.clientid = 1
+    contract, order = _restored(9, "LMT", 29700.0)
+    order.clientId, order.orderRef = 950, "ChartPro"
+    armed.openOrder(9, contract, order, OrderState())
+    assert "c950-9" in armed.orders
+
+    contract, order = _restored(10, "LMT", 29700.0)
+    order.clientId, order.orderType = 950, "TRAIL"
+    armed.openOrder(10, contract, order, OrderState())
+    assert "c950-10" not in armed.orders
+
+
+def test_rejected_order_marked(gateway: IbGateway, armed: IbApi, sink: Sink, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
+    monkeypatch.setattr(armed.client, "placeOrder", lambda *a: None)
+    monkeypatch.setattr(armed.client, "reqIds", lambda *a: None)
+    monkeypatch.setattr(armed, "sync_order_id", lambda: None)
+    req = OrderRequest(symbol="MNQ", exchange=Exchange.CME, direction=Direction.LONG, type=OrderType.LIMIT,
+                       volume=1, price=29000)
+    vt = order_ext.place_order(gateway, req)
+    oid = vt.split(".")[1]
+    armed.error(int(oid), 0, 103, "Duplicate order id")
+    assert armed.orders[oid].status == Status.REJECTED

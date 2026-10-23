@@ -692,9 +692,10 @@ def test_send_order_assigns_order_id(
     assert sink.orders[0].direction == Direction.SHORT
     assert sink.orders[0].type == OrderType.STOP
     assert sink.orders[0].volume == 2
-    assert recorder.names() == ["placeOrder", "reqIds"]
+    # 下单前先向 TWS 取最新订单号（订单号在所有客户号之间共用）
+    assert recorder.names() == ["reqIds", "placeOrder", "reqIds"]
 
-    order_id, contract, placed = recorder.calls[0][1]
+    order_id, contract, placed = recorder.calls[1][1]
     assert order_id == 1
     assert contract.symbol == "SPY"
     assert contract.secType == "STK"
@@ -708,7 +709,7 @@ def test_send_order_assigns_order_id(
     assert placed.clientId == 7
     assert placed.tif == "DAY"
     assert datetime.strptime(placed.orderRef, "%Y-%m-%d %H:%M:%S")
-    assert recorder.calls[1] == ("reqIds", (1,))
+    assert recorder.calls[2] == ("reqIds", (1,))
 
     push_order_status(api, 1, "Submitted", filled="0")
     assert sink.orders[-1].status == Status.NOTTRADED
@@ -729,9 +730,10 @@ def test_next_valid_id_seeds_following_order(
     api.nextValidId(50)
     api.nextValidId(80)
 
-    assert api.orderid == 50
-    assert gateway.send_order(order_request()) == "IB.51"
-    assert recorder.calls[0][1][0] == 51
+    # 订单号随 TWS 推送的 nextValidId 取较大值（别的客户号用过的编号不能再用）
+    assert api.orderid == 79
+    assert gateway.send_order(order_request()) == "IB.80"
+    assert recorder.calls[1][1][0] == 80
 
 
 def test_send_order_rejects_before_assigning_id(api: IbApi, sink: Sink) -> None:

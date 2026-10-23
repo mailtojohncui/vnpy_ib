@@ -33,6 +33,13 @@ def get_api(gateway: IbGateway) -> IbApi | None:
     return api
 
 
+def _sync_id(api: IbApi) -> None:
+    """下单前取最新订单号（订单号在连同一个 TWS 的所有程序之间共用）"""
+    sync = getattr(api, "sync_order_id", None)
+    if sync:
+        sync()
+
+
 def opposite(direction: Direction) -> Direction:
     return Direction.SHORT if direction == Direction.LONG else Direction.LONG
 
@@ -99,6 +106,8 @@ def place_order(gateway: IbGateway, req: OrderRequest, tif: str = "GTC") -> str:
     if not api:
         return ""
 
+    _sync_id(api)
+
     built = _build(api, req, tif)
     if not built:
         return ""
@@ -123,6 +132,8 @@ def place_bracket(
     api: IbApi | None = get_api(gateway)
     if not api:
         return []
+
+    _sync_id(api)
 
     if take_profit is None and stop_loss is None:
         vt_orderid: str = place_order(gateway, req, tif)
@@ -183,6 +194,8 @@ def place_exit(
     api: IbApi | None = get_api(gateway)
     if not api or not position:
         return ""
+
+    _sync_id(api)
 
     direction: Direction = Direction.SHORT if position > 0 else Direction.LONG
     req: OrderRequest = _exit_request(symbol, exchange, direction, abs(position), order_type, price)
@@ -321,7 +334,16 @@ def finish_order_sync(api: IbApi) -> None:
         api.gateway.write_log(f"委托{orderid}在IB上已不存在（可能在断线期间成交或撤销），已移出活动委托")
 
 
+# 下单被拒（订单号冲突、价格不合规、被拒等）：本地委托标记为拒单，图上不再显示为挂着
+REJECT_ERRORS: set[int] = {103, 110, 201, 203, 321, 387, 434, 461}
+
+
 def on_order_error(api: IbApi, reqid: int, error_code: int) -> None:
-    """撤单失败且原因是订单已不存在/已结束时，重新核对挂单"""
+    """下单被拒时更新本地状态；撤单失败且原因是订单已不存在/已结束时，重新核对挂单"""
+    order: OrderData | None = api.orders.get(str(reqid))
+    if error_code in REJECT_ERRORS and order and order.is_active():
+        order.status = Status.REJECTED
+        api.gateway.on_order(copy(order))
+
     if error_code in STALE_ORDER_ERRORS and not api.syncing:
         start_order_sync(api)

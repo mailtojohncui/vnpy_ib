@@ -15,6 +15,7 @@ ConId is also supported for symbol.
 from copy import copy
 from datetime import datetime, timedelta
 from threading import Thread, Condition, Lock
+from threading import Event as ThreadEvent
 from decimal import Decimal
 import shelve
 from tzlocal import get_localzone_name
@@ -295,6 +296,7 @@ class IbApi(EWrapper):
         self.history_condition: Condition = Condition()
         self.history_buf: list[BarData] = []
         self.history_lock: Lock = Lock()
+        self.orderid_event: ThreadEvent = ThreadEvent()        # 收到 nextValidId（自定义扩展）
 
         self.reqid_symbol_map: dict[int, str] = {}              # reqid: subscribe tick symbol
         self.reqid_underlying_map: dict[int, Contract] = {}     # reqid: query option underlying
@@ -328,8 +330,21 @@ class IbApi(EWrapper):
         """下一个有效订单号回报"""
         super().nextValidId(orderId)
 
-        if not self.orderid:
-            self.orderid = orderId
+        # 订单号在同一个 TWS 的所有客户号之间共用：每次都取较大值（自定义修改）
+        self.orderid = max(self.orderid, orderId - 1)
+        self.orderid_event.set()
+
+    def sync_order_id(self, timeout: float = 0.5) -> None:
+        """
+        下单前向 TWS 取最新的可用订单号（自定义扩展）。
+        多个程序（vnpy、独立版、别的电脑）连同一个 TWS 时订单号是共用的，
+        各自往上加会撞号（错误 103 Duplicate order id）。
+        """
+        if not self.status:
+            return
+        self.orderid_event.clear()
+        self.client.reqIds(-1)
+        self.orderid_event.wait(timeout)
 
     def currentTime(self, time: int) -> None:
         """IB当前服务器时间回报"""
@@ -571,14 +586,18 @@ class IbApi(EWrapper):
         if ib_order.parentId:
             self.order_parents[orderid] = self.order_key(ib_order.parentId, ib_order.clientId)
 
-        if ib_order.orderRef:
+        # orderRef 不一定是时间（例如独立版写的 "ChartPro"、TWS 手动单），解析失败用当前时间（自定义修改）
+        try:
             dt: datetime = datetime.strptime(ib_order.orderRef, "%Y-%m-%d %H:%M:%S")
-        else:
+        except (TypeError, ValueError):
             dt = datetime.now()
 
         # 优先使用本地缓存的委托记录，解决交易所传SMART时，返回数据的交易所可能发生变化的问题
         order: OrderData | None = self.orders.get(orderid, None)
         if not order:
+            # 别的客户号可能下了 vnpy 不支持的委托类型（追踪止损等），忽略（自定义修改）
+            if ib_order.orderType not in ORDERTYPE_IB2VT or ib_order.action not in DIRECTION_IB2VT:
+                return
             order = OrderData(
                 symbol=self.generate_symbol(ib_contract),
                 exchange=EXCHANGE_IB2VT.get(ib_contract.exchange, Exchange.SMART),
@@ -1021,6 +1040,8 @@ class IbApi(EWrapper):
         """委托下单"""
         if not self.status:
             return ""
+
+        self.sync_order_id()        # 自定义扩展：订单号与其他客户号共用
 
         if req.exchange not in EXCHANGE_VT2IB:
             self.gateway.write_log(f"不支持的交易所：{req.exchange}")
