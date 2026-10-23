@@ -13,9 +13,10 @@ from decimal import Decimal
 from itertools import count
 
 from ibapi.contract import Contract
+from ibapi.execution import ExecutionFilter
 from ibapi.order import Order
 
-from vnpy.trader.constant import Direction, Exchange, OrderType
+from vnpy.trader.constant import Direction, Exchange, OrderType, Status
 from vnpy.trader.object import OrderData, OrderRequest
 
 from .ib_gateway import DIRECTION_VT2IB, ORDERTYPE_VT2IB, IbApi, IbGateway, generate_ib_contract
@@ -221,14 +222,19 @@ def get_parent(gateway: IbGateway, orderid: str) -> str:
     return api.order_parents.get(orderid, "")
 
 
-def modify_order(gateway: IbGateway, orderid: str, price: float) -> bool:
-    """修改限价单/止损单的价格（同一 orderId 重新提交）"""
+def is_foreign(orderid: str) -> bool:
+    """别的客户号下的单（只读）"""
+    return orderid.startswith(("c", "p"))
+
+
+def modify_order(gateway: IbGateway, orderid: str, price: float, volume: float | None = None) -> bool:
+    """修改限价单/止损单的价格和数量（同一 orderId 重新提交）"""
     api: IbApi | None = get_api(gateway)
     if not api:
         return False
 
     data: OrderData | None = api.orders.get(orderid)
-    if not data or not data.is_active():
+    if not data or not data.is_active() or is_foreign(orderid):
         return False
 
     cached = get_ib_order(gateway, orderid)
@@ -264,6 +270,10 @@ def modify_order(gateway: IbGateway, orderid: str, price: float) -> bool:
     else:
         return False
 
+    if volume:
+        order.totalQuantity = Decimal(str(volume))
+        data.volume = float(volume)
+
     order.transmit = True
     api.client.placeOrder(int(orderid), contract, order)
     api.chart_orders[orderid] = (contract, order)
@@ -271,3 +281,47 @@ def modify_order(gateway: IbGateway, orderid: str, price: float) -> bool:
     data.price = price
     api.gateway.on_order(copy(data))
     return True
+
+
+# ---------------------------------------------------------------------- 挂单核对
+# vnpy_ib 断线重连后不会同步断线期间的变化：期间成交或撤销的委托在本地仍显示为挂着，
+# 撤单时 IB 回复"订单不存在"。连接后主动核对，本地有而 IB 上没有的挂单标记为已撤销。
+
+# 撤单相关错误：10147 订单不存在、10148 订单状态不可撤（已成交/已撤）、161 不在可撤状态
+STALE_ORDER_ERRORS: set[int] = {10147, 10148, 161}
+
+
+def start_order_sync(api: IbApi) -> None:
+    """向 IB 查询全部挂单（含别的客户号下的，只读显示）和当日成交"""
+    if not api.status:
+        return
+    api.sync_seen = set()
+    api.syncing = True
+    api.client.reqAllOpenOrders()
+
+    api.reqid += 1
+    api.client.reqExecutions(api.reqid, ExecutionFilter())
+
+
+def finish_order_sync(api: IbApi) -> None:
+    """挂单回报结束：本地仍为挂单状态、但 IB 没有回报的委托，标记为已撤销"""
+    if not api.syncing:
+        return
+    api.syncing = False
+
+    for orderid, order in list(api.orders.items()):
+        # 只处理已被 IB 确认过的挂单；刚发出、还未确认的（SUBMITTING）不动
+        if order.status not in (Status.NOTTRADED, Status.PARTTRADED):
+            continue
+        if orderid in api.sync_seen:
+            continue
+
+        order.status = Status.CANCELLED
+        api.gateway.on_order(copy(order))
+        api.gateway.write_log(f"委托{orderid}在IB上已不存在（可能在断线期间成交或撤销），已移出活动委托")
+
+
+def on_order_error(api: IbApi, reqid: int, error_code: int) -> None:
+    """撤单失败且原因是订单已不存在/已结束时，重新核对挂单"""
+    if error_code in STALE_ORDER_ERRORS and not api.syncing:
+        start_order_sync(api)

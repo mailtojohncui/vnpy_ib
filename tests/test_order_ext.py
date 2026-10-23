@@ -157,3 +157,109 @@ def test_open_order_records_parent_for_restored_orders(armed: IbApi, recorder: C
     order_id, _, sent = placed(recorder)[-1]
     assert order_id == 42 and sent.auxPrice == 29710.0 and sent.parentId == 41
     assert sent.outsideRth          # 旧单改价时补上盘外触发
+
+
+def _stub_sync(api: IbApi, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    calls: list[str] = []
+    monkeypatch.setattr(api.client, "reqAllOpenOrders", lambda: calls.append("reqOpenOrders"))
+    monkeypatch.setattr(api.client, "reqExecutions", lambda *a: calls.append("reqExecutions"))
+    return calls
+
+
+def _restored(orderid: int, order_type: str, price: float) -> tuple[Contract, Order]:
+    contract: Contract = Contract()
+    contract.symbol = "MNQ"
+    contract.secType = "FUT"
+    contract.exchange = "CME"
+    contract.currency = "USD"
+    contract.lastTradeDateOrContractMonth = "20261218"
+    order: Order = Order()
+    order.orderId = orderid
+    order.action = "SELL"
+    order.orderType = order_type
+    order.totalQuantity = Decimal("1")
+    order.orderRef = ""
+    if order_type == "LMT":
+        order.lmtPrice = price
+    else:
+        order.auxPrice = price
+    return contract, order
+
+
+def test_reconnect_sync_removes_orders_gone_during_disconnect(
+    gateway: IbGateway, armed: IbApi, sink: Sink, monkeypatch: pytest.MonkeyPatch  # noqa: F811
+) -> None:
+    calls = _stub_sync(armed, monkeypatch)
+
+    # 断线前：一个止盈、一个止损挂着
+    for oid, kind, price in ((10, "LMT", 29700.0), (11, "STP", 29600.0)):
+        armed.openOrder(oid, *_restored(oid, kind, price), OrderState())
+        armed.orders[str(oid)].status = Status.NOTTRADED
+    # 刚发出、尚未确认的单子不能被误判
+    order_ext.place_order(gateway, mnq_request())
+    armed.orders["1"].status = Status.SUBMITTING
+
+    # TWS 重启期间止损成交、止盈被 OCA 撤销；重连后 IB 只回报还挂着的单（这里一个都没有）
+    armed.managedAccounts("DU123")
+    assert calls == ["reqOpenOrders", "reqExecutions"]
+    armed.openOrderEnd()
+
+    assert armed.orders["10"].status == Status.CANCELLED
+    assert armed.orders["11"].status == Status.CANCELLED
+    assert armed.orders["1"].status == Status.SUBMITTING
+    assert any("已不存在" in log for log in sink.logs)
+
+
+def test_sync_keeps_orders_still_open(armed: IbApi, monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_sync(armed, monkeypatch)
+    armed.openOrder(20, *_restored(20, "LMT", 29700.0), OrderState())
+    armed.orders["20"].status = Status.NOTTRADED
+
+    order_ext.start_order_sync(armed)
+    armed.openOrder(20, *_restored(20, "LMT", 29700.0), OrderState())   # IB 回报：仍然挂着
+    armed.openOrderEnd()
+    assert armed.orders["20"].status == Status.NOTTRADED
+
+
+def test_cancel_not_found_error_triggers_sync(armed: IbApi, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _stub_sync(armed, monkeypatch)
+    armed.openOrder(30, *_restored(30, "STP", 29600.0), OrderState())
+    armed.orders["30"].status = Status.NOTTRADED
+
+    armed.error(30, 0, 10147, "OrderId 30 that needs to be cancelled is not found.")
+    assert calls[0] == "reqOpenOrders"
+    armed.openOrderEnd()
+    assert armed.orders["30"].status == Status.CANCELLED
+
+    # 普通通知不会触发核对
+    calls.clear()
+    armed.error(-1, 0, 2104, "Market data farm connection is OK")
+    assert calls == []
+
+
+def test_foreign_orders_get_prefixed_ids(gateway: IbGateway, armed: IbApi, sink: Sink) -> None:  # noqa: F811
+    """别的客户号下的单：编号加前缀，不能改单"""
+    armed.clientid = 1
+    contract, order = _restored(7, "STP", 29600.0)
+    order.clientId = 950
+    armed.openOrder(7, contract, order, OrderState())
+    assert "c950-7" in armed.orders and "7" not in armed.orders
+    assert not order_ext.modify_order(gateway, "c950-7", 29610.0)
+
+    contract, order = _restored(0, "LMT", 29700.0)
+    order.clientId, order.permId = 0, 123456
+    armed.openOrder(0, contract, order, OrderState())
+    assert "p123456" in armed.orders
+
+
+def test_modify_order_volume(gateway: IbGateway, armed: IbApi, sink: Sink, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
+    calls: list = []
+    monkeypatch.setattr(armed.client, "placeOrder", lambda *a: calls.append(a))
+    monkeypatch.setattr(armed.client, "reqIds", lambda *a: None)
+    req = OrderRequest(symbol="MNQ", exchange=Exchange.CME, direction=Direction.LONG, type=OrderType.LIMIT,
+                       volume=1, price=29000)
+    vt = order_ext.place_order(gateway, req)
+    oid = vt.split(".")[1]
+    armed.orders[oid].status = Status.NOTTRADED
+    assert order_ext.modify_order(gateway, oid, 29001.0, 3)
+    assert calls[-1][2].totalQuantity == Decimal("3") and armed.orders[oid].volume == 3

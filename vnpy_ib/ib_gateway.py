@@ -307,6 +307,8 @@ class IbApi(EWrapper):
         self.ib_open_orders: dict[str, tuple[Contract, Order]] = {}    # openOrder 回报的 IB 委托
         self.chart_orders: dict[str, tuple[Contract, Order]] = {}      # 本地下单时保存的 IB 委托
         self.order_parents: dict[str, str] = {}                        # 括号单子单 -> 入场单
+        self.syncing: bool = False                                     # 正在和 IB 核对挂单
+        self.sync_seen: set[str] = set()                               # 核对期间 IB 回报的挂单
 
     def connectAck(self) -> None:
         """连接成功回报"""
@@ -349,6 +351,10 @@ class IbApi(EWrapper):
     ) -> None:
         """具体错误请求回报"""
         super().error(reqId, errorTime, errorCode, errorString)
+
+        # 撤单时 IB 回复订单不存在/不可撤：说明本地状态过期，重新核对挂单（自定义扩展）
+        from .order_ext import on_order_error
+        on_order_error(self, reqId, errorCode)
 
         # 2000-2999信息通知不属于报错信息
         if reqId == self.history_reqid and errorCode not in range(2000, 3000):
@@ -530,7 +536,9 @@ class IbApi(EWrapper):
             mktCapPrice,
         )
 
-        orderid: str = str(orderId)
+        orderid: str = self.order_key(orderId, clientId)
+        if orderid not in self.orders:
+            orderid = str(orderId)
         order: OrderData | None = self.orders.get(orderid, None)
         if not order:
             return
@@ -554,12 +562,14 @@ class IbApi(EWrapper):
         """新订单回报"""
         super().openOrder(orderId, ib_contract, ib_order, orderState)
 
-        orderid: str = str(orderId)
+        # 别的客户号（独立版、别的电脑、TWS 手动）下的单加前缀，避免和本客户号的编号重复（自定义扩展）
+        orderid: str = self.order_key(orderId, ib_order.clientId, ib_order.permId)
 
         # 记录 IB 委托对象和括号单关系，供图上改单使用（自定义扩展）
         self.ib_open_orders[orderid] = (ib_contract, ib_order)
+        self.sync_seen.add(orderid)
         if ib_order.parentId:
-            self.order_parents[orderid] = str(ib_order.parentId)
+            self.order_parents[orderid] = self.order_key(ib_order.parentId, ib_order.clientId)
 
         if ib_order.orderRef:
             dt: datetime = datetime.strptime(ib_order.orderRef, "%Y-%m-%d %H:%M:%S")
@@ -766,7 +776,9 @@ class IbApi(EWrapper):
             dt = dt.astimezone(LOCAL_TZ)
 
         # 优先使用本地缓存的委托记录，解决交易所传SMART时，返回数据的交易所可能发生变化的问题
-        orderid: str = str(execution.orderId)
+        orderid: str = self.order_key(execution.orderId, execution.clientId, execution.permId)
+        if orderid not in self.orders and str(execution.orderId) in self.orders:
+            orderid = str(execution.orderId)
         order: OrderData | None = self.orders.get(orderid, None)
 
         if order:
@@ -803,6 +815,24 @@ class IbApi(EWrapper):
 
         self.gateway.write_log(f"当前使用的交易账号为{self.account}")
         self.client.reqAccountUpdates(True, self.account)
+
+        # 每次（重新）连接后和 IB 核对挂单、补回断线期间的成交（自定义扩展）
+        from .order_ext import start_order_sync
+        start_order_sync(self)
+
+    def order_key(self, orderId: int, clientId: int, permId: int = 0) -> str:     # noqa: N803
+        """本客户号的委托用 orderId；别的客户号加前缀 c客户号-编号（TWS 手动单用 p永久编号）（自定义扩展）"""
+        if clientId in (self.clientid, 0) and orderId > 0:
+            return str(orderId)
+        if orderId > 0:
+            return f"c{clientId}-{orderId}"
+        return f"p{permId}"
+
+    def openOrderEnd(self) -> None:
+        """挂单回报结束（自定义扩展）"""
+        super().openOrderEnd()
+        from .order_ext import finish_order_sync
+        finish_order_sync(self)
 
     def historicalData(self, reqId: int, ib_bar: IbBarData) -> None:
         """历史数据更新回报"""
